@@ -1,0 +1,115 @@
+---
+title: "Benchmarks: cmdstanr, stanli, brms, TMB/RTMB and glmmTMB on simple GLM(M)s"
+format:
+  gfm:
+    output-file: README.md
+    wrap: none
+    variant: +tex_math_gfm
+execute:
+  echo: false
+---
+
+::: {.content-visible when-format="markdown"}
+> **Note:** this file is generated from [`README.qmd`](README.qmd) by `quarto render` (or `make`). Edit the `.qmd`, not this `.md`.
+:::
+
+This repo compares the speed of several engines on simple GLMs and GLMMs that [glmmTMB](https://CRAN.R-project.org/package=glmmTMB) can also fit:
+
+- [cmdstanr](https://mc-stan.org/cmdstanr/) with CmdStan 2.40.0;
+- [stanli](https://github.com/seantalts/stanli), a new Stan compiler and runtime;
+- [brms](https://CRAN.R-project.org/package=brms). Its generated Stan code is run through cmdstanr and stanli;
+- [TMB](https://CRAN.R-project.org/package=TMB) (C++ templates) and [RTMB](https://CRAN.R-project.org/package=RTMB), sampled with [tmbstan](https://CRAN.R-project.org/package=tmbstan) or [StanEstimators](https://github.com/andrjohns/StanEstimators);
+- glmmTMB, both its maximum-likelihood (Laplace) fit and its objective sampled with tmbstan.
+
+## Models
+
+The five models come from [posteriordb](https://github.com/stan-dev/posteriordb), the collection that stanli's [published benchmarks](https://github.com/seantalts/stanli/blob/main/docs/benchmarks.md) use. Our results can therefore be compared with theirs. None of these five posteriors has posteriordb reference draws.
+
+| short name | posteriordb posterior | model | obs | params | stanli gradient speedup (published) |
+|---|---|---|--:|--:|--:|
+| `glm_pois` | `GLM_Poisson_Data-GLM_Poisson_model` | Poisson GLM, cubic in year | 40 | 4 | 2.77x |
+| `glm_binom` | `GLM_Binomial_data-GLM_Binomial_model` | binomial GLM, quadratic in year | 40 | 3 | 1.59x |
+| `glmm_pois` | `GLMM_Poisson_data-GLMM_Poisson_model` | Poisson, cubic in year + observation-level RE (centered) | 40 | 45 | 2.85x |
+| `glmm1` | `GLMM_data-GLMM1_model` | Poisson, site random intercept (centered) | 2072 | 237 | 3.32x |
+| `radon_vis` | `radon_mn-radon_variable_intercept_slope_noncentered` | Gaussian LMM, county intercept and slope (non-centered) | 919 | 175 | — |
+
+## How the engines are made comparable
+
+- The RTMB (`R/models.R`) and TMB (`src/*.cpp`) objectives are the negative log posterior on **Stan's unconstrained scale**, Jacobian included, with parameters in Stan's declaration order. Their function and gradient values can therefore be compared directly with cmdstanr's `log_prob()`/`grad_log_prob()` and stanli's `log_prob_grad()`. tmbstan and StanEstimators then sample the same target as Stan.
+- glmmTMB and brms use their own parameterizations and priors (brms priors are set to approximate the posteriordb priors). They represent the typical user's path, not a like-for-like comparison.
+- **glmmTMB's own fits are point estimates.** Its `ml_fit` timing is a maximum-likelihood fit. With priors it is a maximum a posteriori (MAP) fit (the mode of the Laplace-approximated marginal posterior), not a posterior mean or median and not posterior intervals. Its speed advantage is therefore not an MCMC-to-MCMC comparison. Only the `tmbstan_glmmTMB*` engines give glmmTMB-based posterior samples.
+- `tmbstan_glmmTMB_prior` adds priors through glmmTMB's `priors` argument. Fixed-effect priors match posteriordb exactly. For SD parameters, glmmTMB's `normal` prior acts on log-SD, and its `gamma` prior acts on the SD *without* a Jacobian. Under tmbstan, which samples log-SD, `gamma(mean, shape = 2)` is therefore an exponential prior on the SD with scale `mean/2`. We use a large mean as an almost flat stand-in for `uniform(0, 5)`, and the same-mean exponential in place of half-normal(0, 1).
+- `R/check_equiv.R` evaluates the log density and gradient at 10 points from a short cmdstanr run. Log densities may differ by a constant, because Stan's `~` drops normalizing constants. Gradients must agree exactly.
+
+```{r equiv}
+f <- here::here("results", "equiv_check.rds")
+if (file.exists(f)) {
+  eq <- readRDS(f)
+  eq$lp_offset <- signif(eq$lp_offset, 3)
+  eq$lp_maxdev <- signif(eq$lp_maxdev, 2)
+  eq$grad_maxrel <- signif(eq$grad_maxrel, 2)
+  knitr::kable(eq, caption = paste(
+    "Agreement with cmdstanr: `lp_offset` is the mean log-density difference",
+    "(a constant), `lp_maxdev` the largest deviation from it, `grad_maxrel`",
+    "the largest gradient difference relative to the largest gradient component."))
+}
+```
+
+## Timing categories
+
+Each engine × model reports these separately. Every measurement runs in a fresh R process (`callr`). One reason is that cmdstanr's compiled model methods segfault in a session that has already loaded rstan/tmbstan or StanEstimators.
+
+1. **Compilation/setup** (`R/bench_eval.R`; median of `N_COMPILE` repeats). For cmdstanr and brms code: stanc alone, the full compile, and the separate compile with model methods; brms code generation is reported too. For stanli: compile + bind. For TMB: `TMB::compile` from scratch, then `MakeADFun`. For RTMB: `MakeADFun` (taping). For glmmTMB: model construction and the ML fit.
+2. **Function evaluation**: time per call from R, at 10 points selected as in stanli's protocol from a 1-chain cmdstanr reference run. For TMB/RTMB, both `obj$fn` and the lighter `obj$env$f` are timed. stanli's R interface has no density-only call, so its function and gradient time is one combined number.
+3. **Gradient evaluation**: as for function evaluation.
+4. **Sampling** (`R/bench_sample.R`): 4 chains × (1000 warmup + 1000 draws), run one after another, `N_REP` seeds. Reported as total chain time (warmup and sampling separately), time per 1000 bulk ESS (minimum `posterior::ess_bulk` over the sampled parameters), and **time per gradient inside the sampler**, i.e. total time divided by total leapfrog steps.
+
+For small models, the per-call times from R (items 2 and 3) are dominated by the R-to-C++ call overhead of a few µs. cmdstan, stanli and tmbstan don't pay that overhead while sampling: tmbstan passes the TMB tape pointer to Stan's C++ sampler. StanEstimators does pay it, because it calls R functions. The in-sampler time per gradient is therefore the comparable measure of per-gradient cost.
+
+Engines sampled: `cmdstan`, `stanli`, `stanli_fast` (posteriordb code); `brms_cmdstan`, `brms_stanli` (brms-generated code); `brms_brm` (`brm()` itself with the cmdstanr backend: compile time from `brm(chains = 0)` reported as `t_compile`, then `update(recompile = FALSE)` for sampling and the `brmsfit`; no warmup diagnostics, so no time per gradient); `tmbstan_rtmb`, `tmbstan_tmb`; `tmbstan_glmmTMB` (glmmTMB's objective, flat priors, all parameters sampled jointly) and `tmbstan_glmmTMB_prior` (the same with matched priors, see above); `stanest_rtmb` (StanEstimators with the RTMB objective).
+
+## Relation to stanli's benchmark protocol
+
+From stanli's [`docs/benchmarks.md`](https://github.com/seantalts/stanli/blob/main/docs/benchmarks.md) (appendix "How we measure") and `notes/performance/`:
+
+- **What is evaluated:** both engines use the sampling log density (`propto = true`) with the Jacobian, at the same 10 unconstrained points. The points come from one stanli NUTS reference run (1 chain, seed 1, 1000 + 1000 iterations). They are chosen systematically by cumulative gradient count, so busy parts of the run get more points. Models whose reference run fails fall back to fixed or pseudo-random points and 5000 gradients.
+- **Numerical gate:** the log density and every gradient component must agree within the scaled error `abs(a-b) / max(abs(a), abs(b), 1) <= 1e-9`.
+- **Gradient timing:** each engine evaluates every point once untimed, warms up for at least 20 ms, calibrates a batch size per point, and times batches for at least 40 ms per point. The gradient time is the mean over points. Each measurement runs in a fresh process, one engine at a time. Six pairs alternate the run order, and the reported speedup is the median of the six within-pair ratios (MADs are kept).
+- **Setup:** for stanli, the source-to-MIR compile plus the median of 6 preparations from MIR and data. For CmdStan, stanc plus a fresh C++ build, with precompiled headers and common dependencies built in advance. CmdStan data loading is not counted.
+- **"Total sampling" is an estimate, not a timed run:** setup plus the reference run's gradient count times the warm gradient time. The same count is used for both engines, so the estimate assumes CmdStan's sampler would take as many gradients as stanli's. Adaptation, tree building, generated quantities and CSV output are left out. Separate full runs (CLI, 4 single-chain seeds) appear only for a few teaching examples.
+- **Hardware:** Apple M3 Ultra, one thread per engine. CmdStan uses its default compiler settings, but on macOS the benchmark links only `tbb`, not `tbbmalloc_proxy`, matching Linux. A separate comparison turns on stanc's loop vectorization.
+- **Not reported:** ESS or time to a given inferential accuracy.
+
+What we do differently: we time real sampling runs and report time per 1000 bulk ESS, and we run on Linux (AMD Ryzen 9 3950X). We use their gate for the agreement check, and their point selection (from a cmdstanr reference run rather than stanli's), per-point warmup and batching for the function and gradient timings. We don't use their alternating pairs of fresh processes: each engine × model gets one fresh process. Our function and gradient timings are calls from R, not from C++ (see above).
+
+## Running
+
+```sh
+make get_pkgs     # install packages, CmdStan 2.40.0 and the stanli runtime
+make              # agreement check, then this README
+make bench        # evaluation and sampling timings (about an hour)
+```
+
+To run a subset, set `MODELS` and `ENGINES` (comma-separated), e.g. `MODELS=glmm1 ENGINES=stanli,cmdstan Rscript R/bench_sample.R`. `N_COMPILE` and `N_REP` set the number of repeats. New results are merged into the existing `.rds` files.
+
+The Makefile sets `OPENBLAS_NUM_THREADS`, `OMP_NUM_THREADS` and `MKL_NUM_THREADS` to 1 so that timings aren't affected by BLAS/OpenMP threading.
+
+## Layout
+
+- `get_pkgs.R`: installs the required packages;
+- `models/`: Stan code and JSON data from posteriordb, cached by `get_pdb_model()`;
+- `R/models.R`: model definitions (RTMB, glmmTMB, brms) and builder functions;
+- `src/`: TMB C++ templates;
+- `R/check_equiv.R`: log density and gradient agreement check;
+- `R/bench_utils.R`: shared helpers (point selection, timing, ESS);
+- `R/bench_eval.R`, `R/eval_worker.R`: setup, function and gradient timings;
+- `R/bench_sample.R`, `R/sample_worker.R`: sampling timings;
+- `results/`: outputs (`equiv_check.rds`, `eval_timings.rds`, `sample_timings.rds`, evaluation points in `points/`).
+
+## Status
+
+- [x] choose models; RTMB/TMB/glmmTMB/brms versions; agreement check
+- [x] timing of compilation, function and gradient evaluation (`R/bench_eval.R`)
+- [x] sampling timings and ESS (`R/bench_sample.R`)
+- [ ] report
+- [ ] later: a wider set of models
